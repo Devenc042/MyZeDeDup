@@ -1,0 +1,14 @@
+if (out != null) out.println('Starting script3');
+
+if (masterPatient.firstName.equals("Devenda")){
+    out.println("Name matched");
+} else { out.println("Name not matched");}
+
+var diff = masterPatient.lastUpdateDate.getTime() - newRecord.lastUpdateDate.getTime();
+out.println("difference in time: "+ diff);
+if ( diff < 0){
+    masterPatient.address = newRecord.address;
+    out.println("Address changed with new one");
+}
+
+return masterPatient;

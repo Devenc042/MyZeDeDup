@@ -1,0 +1,16 @@
+// This tests for JEXL-47. AL header above tests for block comments.
+
+##
+## This is a test script
+##
+if (out != null) out.println('Starting script');
+x = 1;
+y = 2;
+result = x * y + 5;
+if (out != null) out.println("The result is " + result);
+## return the result.
+result; // JEXL-44 should ignore "quotes" here
+
+/*
+   Trailing comments are also ignored
+*/

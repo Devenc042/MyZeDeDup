@@ -1,0 +1,7 @@
+if (out != null) out.println('Starting script2');
+max = x;
+if(x>y){
+max = x; return x; }
+else {
+max = y; return y;}
+
