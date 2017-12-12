@@ -1,0 +1,528 @@
+package com.zemoso.zededup.dedup.service;
+
+import com.zemoso.zededup.base.exceptions.ZeDeDupeException;
+import com.zemoso.zededup.jexl.JexlService;
+import com.zemoso.zededup.master.model.Master;
+import com.zemoso.zededup.master.service.MasterService;
+import com.zemoso.zededup.patient.model.Patient;
+import com.zemoso.zededup.patient.service.PatientService;
+import com.zemoso.zededup.patient.vo.GetDataRequestVO;
+import com.zemoso.zededup.patient.vo.GetDataResponseVO;
+import com.zemoso.zededup.patient.vo.MatchedMaster;
+import com.zemoso.zededup.patientstatus.StatusEnum;
+import com.zemoso.zededup.patientstatus.model.PatientDedupStatus;
+import com.zemoso.zededup.util.FHIRUtil;
+import org.apache.commons.jexl3.*;
+import org.apache.commons.lang3.tuple.MutablePair;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.common.collect.MapBuilder;
+import org.elasticsearch.common.lucene.search.function.CombineFunction;
+import org.elasticsearch.common.lucene.search.function.FiltersFunctionScoreQuery;
+import org.elasticsearch.index.query.functionscore.ScoreFunctionBuilders;
+import org.elasticsearch.script.Script;
+import org.elasticsearch.script.ScriptType;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.util.*;
+
+import static com.zemoso.zededup.base.util.JacksonUtil.OBJECT_MAPPER;
+import static com.zemoso.zededup.base.util.JacksonUtil.fromFile;
+import static com.zemoso.zededup.base.util.JacksonUtil.fromString;
+import static com.zemoso.zededup.patientstatus.StatusEnum.FLAGGED_FOR_MANUAL_MERGE;
+import static com.zemoso.zededup.util.Constants.*;
+import static com.zemoso.zededup.util.DateUtil.parseDateFromString;
+import static com.zemoso.zededup.util.FHIRUtil.convertFHIR;
+import static com.zemoso.zededup.util.GenderEnum.getGender;
+import static com.zemoso.zededup.util.ValidatorUtils.hasElements;
+import static java.util.Collections.max;
+import static org.elasticsearch.index.query.QueryBuilders.functionScoreQuery;
+
+/**
+ * Created by shanku on 8/9/17.
+ */
+@Service
+public class DedupServiceImpl implements DedupService {
+
+    private static final Logger LOGGER = Logger.getLogger(DedupServiceImpl.class);
+
+    @Autowired
+    private RestHighLevelClient elasticSearchClient;
+
+    @Autowired
+    private PatientService patientService;
+
+    @Autowired
+    private MasterService masterService;
+
+    @Autowired
+    private JexlService jexlService;
+
+    @Value("${search.params.path}")
+    private String filePath;
+
+    @Value("${elasticsearch.master.index.name}")
+    private String indexName;
+
+    private Map<String, Object> configurationMap;
+
+    //compares by score - sorts by highest score and if 2 records have the same score, returns 0
+    private static Comparator<SearchHit> maxScoreComparator = (SearchHit o1, SearchHit o2) -> {
+        if (o1.getScore() > o2.getScore())
+            return -1;
+        return 0;
+    };
+
+    // To obtain resource file with relative path from application.properties file
+    @PostConstruct
+    private void postConstruct() {
+        Resource resource = new ClassPathResource(filePath);
+        try{
+            configurationMap = OBJECT_MAPPER.readValue(resource.getFile(), Map.class);;
+        }catch(IOException e){
+            LOGGER.log(Level.INFO,"Error in reading searchRequestfiles",e);
+        }
+    }
+
+    /**
+     * receives patient record
+     * executes search in indexed master records
+     * processes merge as required
+     *
+     * @param patientData
+     */
+    @Override
+    public void runDedup(String patientData) {
+        SearchSourceBuilder request = buildSearchRequest(patientData);
+        LOGGER.log(Level.INFO, "Request : \n" + request.toString());
+        try {
+            SearchResponse searchResponse = elasticSearchClient.search(new SearchRequest().source(request).indices(indexName));
+            LOGGER.log(Level.INFO, "Response : \n" + searchResponse.toString());
+
+            processMerge(Arrays.asList(searchResponse.getHits().getHits()), patientData);
+        } catch (IOException e) {
+            LOGGER.log(Level.ERROR, "Some problem in elasticsearch", e);
+        } catch (Exception e) {
+            LOGGER.log(Level.ERROR, "Some problem in processing elasticsearch search results", e);
+        }
+    }
+
+    /**
+     * builds search request using fhir message and search paramters config file
+     *
+     * @param fhirMessage
+     * @return
+     */
+    protected SearchSourceBuilder buildSearchRequest(String fhirMessage) {
+        SearchSourceBuilder searchRequestBuilder = null;
+        try {
+            ArrayList<Map<String, Object>> fields = (ArrayList<Map<String, Object>>) configurationMap.get("fields");
+
+            Map<String, Object> fhirMap = convertFHIR(fhirMessage);
+
+            for (Map<String, Object> field : fields) {
+                field.put("value", fhirMap.get(field.get("field")));
+            }
+
+            Map<String, Object> params = MapBuilder.<String, Object>newMapBuilder().map();
+
+            params.put("entity",
+                    new MapBuilder<String, ArrayList<Map<String, Object>>>().put("fields", fields).map());
+
+
+            searchRequestBuilder = new SearchSourceBuilder()
+                    .size((int) configurationMap.get("resultssize"))
+                    .query(functionScoreQuery(ScoreFunctionBuilders.scriptFunction(new Script(ScriptType.INLINE, "expert_scripts", "pure_df", params)))
+                            .boostMode(CombineFunction.REPLACE)
+                            .scoreMode(FiltersFunctionScoreQuery.ScoreMode.MAX)
+                            .setMinScore(new BigDecimal((Double) configurationMap.get("maybethreshold")).floatValue()));
+
+        } catch (Exception e) {
+            LOGGER.log(Level.ERROR, "Exception in building elasticsearch search request>>", e);
+        }
+
+        return searchRequestBuilder;
+    }
+
+    /**
+     * runDedup merge based on threshold,mayBeThreshold and score of each matched record
+     *
+     * @param searchHits
+     * @param patient
+     */
+    protected void processMerge(List<SearchHit> searchHits, String patient) {
+        List<SearchHit> matchedSearchHits = new ArrayList<>();
+        List<MatchedMaster> maybeMatchRecords = new ArrayList<>();
+        List<MatchedMaster> matchedRecords = new ArrayList<>();
+
+        if (hasElements(searchHits)) {
+
+            //group search hits by threshold, may be threshold
+            groupSearchHits(searchHits, matchedSearchHits, maybeMatchRecords, matchedRecords);
+
+            //if there are matched records
+            if (hasElements(matchedSearchHits)) {
+                //and it is only 1, auto merge
+                if (matchedSearchHits.size() == 1) {
+                    SearchHit searchHit = matchedSearchHits.get(0);
+                    autoMerge(patient, Long.valueOf(searchHit.getId()), searchHit.getScore());
+                } else {
+                    //find the most matched record
+                    SearchHit maxScore = max(matchedSearchHits, maxScoreComparator);
+                    if (maxScore != null) {
+                        //if found, auto merge
+                        autoMerge(patient, Long.valueOf(maxScore.getId()), maxScore.getScore());
+                    } else {
+                        //not found, flag for manual merge
+                        flagForManualMerge(patient, matchedRecords);
+                    }
+                }
+
+            } else if (hasElements(maybeMatchRecords)) {
+                flagForManualMerge(patient, maybeMatchRecords);
+            }
+        } else {
+            createNewMaster(patient);
+        }
+    }
+
+    /**
+     * groups searchresponse into matchedRecords which have score gerater than threshold
+     * and maybeMatchRecords which have score between threshold and may be thrshold
+     *
+     * @param searchHits
+     * @param matchedSearchHits
+     * @param maybeMatchRecords
+     * @param matchedRecords
+     */
+    protected void groupSearchHits(List<SearchHit> searchHits,
+                                   List<SearchHit> matchedSearchHits,
+                                   List<MatchedMaster> maybeMatchRecords,
+                                   List<MatchedMaster> matchedRecords) {
+        for (SearchHit searchHit : searchHits) {
+            MatchedMaster matchedMaster = MatchedMaster.builder().id(Long.valueOf(searchHit.getId()))
+                    .probabiltyScore(searchHit.getScore())
+                    .build();
+            if (searchHit.getScore() >= Float.parseFloat(configurationMap.get("threshold").toString())) {
+                matchedSearchHits.add(searchHit);
+                matchedRecords.add(matchedMaster);
+            } else {
+                maybeMatchRecords.add(matchedMaster);
+            }
+        }
+    }
+
+    /**
+     * Merge patient with master
+     *
+     * @param patientData
+     * @param masterId
+     * @param probabilityScore
+     */
+    @Transactional
+    @Override
+    public void autoMerge(String patientData, Long masterId, Float probabilityScore) {
+
+        try {
+
+            Patient patient = createPatientRecordFromFHIR(masterId, patientData);
+
+            autoMergeMaster(masterId, patientData);
+
+            PatientDedupStatus patientDedupStatus = PatientDedupStatus.builder()
+                    .probabilityScore(probabilityScore)
+                    .status(StatusEnum.AUTO_MERGE.getValue())
+                    .masterId(masterId)
+                    .patientId(patient.getId())
+                    .build();
+
+            patientService.save(patientDedupStatus);
+
+
+
+        } catch (Exception e) {
+            throw new ZeDeDupeException("Exception in autoMerge>>>>>", e);
+        }
+    }
+
+
+    /**
+     * Create new master from patient
+     *
+     * @param patientData
+     */
+    @Transactional
+    @Override
+    public void createNewMaster(String patientData) {
+        try {
+            Master master = createMasterRecordFromFHIR(patientData);
+
+            Patient patient = createPatientRecordFromFHIR(master.getId(), patientData);
+
+            PatientDedupStatus patientDedupStatus = PatientDedupStatus.builder().probabilityScore(1.0F)
+                    .status(StatusEnum.NEW_RECORD.getValue())
+                    .masterId(master.getId())
+                    .patientId(patient.getId())
+                    .build();
+
+            patientService.save(patientDedupStatus);
+        } catch (Exception e) {
+            throw new ZeDeDupeException("Exception in creating new record>>>>>", e);
+        }
+    }
+
+    /**
+     * Flags the patient records are requiring manual merge
+     *
+     * @param patientData
+     * @param matchedMasters
+     */
+    @Transactional
+    @Override
+    public void flagForManualMerge(String patientData, List<MatchedMaster> matchedMasters) {
+        try {
+            Patient patient = createPatientRecordFromFHIR(null, patientData);
+
+            for (MatchedMaster matchedMaster : matchedMasters) {
+                PatientDedupStatus patientDedupStatus = PatientDedupStatus.builder().probabilityScore(matchedMaster.getProbabiltyScore())
+                        .status(FLAGGED_FOR_MANUAL_MERGE.getValue())
+                        .masterId(matchedMaster.getId())
+                        .patientId(patient.getId())
+                        .build();
+                patientService.save(patientDedupStatus);
+            }
+        } catch (Exception e) {
+            throw new ZeDeDupeException("Exception in flgging data for manual merge>>>", e);
+
+        }
+    }
+
+    /**
+     * It will give all patientstatus data having status flagForManualMerge
+     *
+     * @return
+     */
+    @Transactional(readOnly = true)
+    @Override
+    public Pair<Long, List<GetDataResponseVO>> getDataFlaggedForManualMerge(GetDataRequestVO getDataRequestVO) {
+        Long totalRecords = patientService.getRecordsCountByStatus(FLAGGED_FOR_MANUAL_MERGE.getValue());
+        List<GetDataResponseVO> getDataResponseVOS = null;
+        if (totalRecords > 0) {
+            getDataResponseVOS = patientService.getDataFlaggedForManualMerge(getDataRequestVO);
+        }
+        return new MutablePair<>(totalRecords, getDataResponseVOS);
+    }
+
+    @Transactional(readOnly = true)
+    @Override
+    public Map<String, Object> getPatientRecordFlaggedForManualMerge(Long id) {
+        List<PatientDedupStatus> patientStatusDetails = patientService.findByStatusAndPatientId(FLAGGED_FOR_MANUAL_MERGE.getValue(), id);
+        Map<String, Object> responseMap = new HashMap<>();
+        if (hasElements(patientStatusDetails)) {
+            responseMap.put(ID, id);
+            Map<String, Object> patientMap = convertFHIR(patientService.findOne(id).getData());
+            patientMap.remove("fullName");
+            patientMap.put(ID, id);
+            responseMap.put(NEW_PATIENT_RECORD, patientMap);
+            List<Map<String, Object>> masters = new ArrayList<>();
+
+            patientStatusDetails.forEach((patientStatusDetail -> {
+                Master master = masterService.findOne(patientStatusDetail.getMasterId());
+                Map<String, Object> objectMap = new HashMap<>();
+                objectMap.put(ID, master.getId());
+                objectMap.put(FIRST_NAME, master.getFirstName());
+                objectMap.put(MIDDLE_NAME, master.getMiddleName() != null ? master.getMiddleName() : "");
+                objectMap.put(LAST_NAME, master.getLastName());
+                objectMap.put(DATE_OF_BIRTH, master.getDob());
+                objectMap.put(GENDER, master.getGender());
+                masters.add(objectMap);
+            }));
+
+            responseMap.put(MASTER_RECORDS, masters);
+            Map<String, String> attributes = new HashMap<>();
+            attributes.put(ID, "Id");
+            attributes.put(FIRST_NAME, "First Name");
+            attributes.put(MIDDLE_NAME, "Middle Name");
+            attributes.put(LAST_NAME, "Last Name");
+            attributes.put(DATE_OF_BIRTH, "Date Of Birth");
+            attributes.put(GENDER, "Gender");
+            responseMap.put(ATTRIBUTES, attributes);
+        } else {
+            throw new ZeDeDupeException("Patient Record[" + id + "] not found");
+        }
+        return responseMap;
+    }
+
+    /**
+     * Merge data into selected master record from patient record and update status as Manual Merge,
+     * set status for other matched master record as Manual Ignore
+     *
+     * @param patientId
+     * @param mergeMasterDetails
+     * @param ignoredMasterIds
+     */
+    @Transactional
+    @Override
+    public void processManualMerge(Long patientId, Map<String, Object> mergeMasterDetails, List<Long> ignoredMasterIds) {
+        Long masterId = Long.valueOf((Integer) mergeMasterDetails.get(ID));
+        try {
+            Patient patient = patientService.findOne(patientId);
+            patient.setMasterId(masterId);
+            patientService.save(patient);
+
+            manualMergeMaster(mergeMasterDetails, masterId);
+
+            PatientDedupStatus patientDedupStatus = patientService.findByMasterIdAndPatientId(masterId, patientId);
+            patientDedupStatus.setStatus(StatusEnum.MANUAL_MERGE.getValue());
+            patientService.save(patientDedupStatus);
+
+            patientService.updateManualIgnore(patientId, ignoredMasterIds);
+
+        } catch (Exception e) {
+            throw new ZeDeDupeException("Exception in processing manual merge of " +
+                    "patient[" + patientId + "] with master record[" + masterId + "]>>>", e);
+        }
+    }
+
+    /**
+     * Sets status of all records as ignored merge and creates new master
+     *
+     * @param patientId
+     * @param ignoredMasterIds
+     */
+    @Transactional
+    @Override
+    public Long ignoreManualMerge(Long patientId, List<Long> ignoredMasterIds) {
+        try {
+
+            patientService.updateManualIgnore(patientId, ignoredMasterIds);
+
+            Patient patient = patientService.findOne(patientId);
+
+            Master master = createMasterRecordFromFHIR(patient.getData());
+
+            PatientDedupStatus patientDedupStatus = PatientDedupStatus.builder().probabilityScore(1.0F)
+                    .status(StatusEnum.NEW_RECORD.getValue())
+                    .masterId(master.getId())
+                    .patientId(patientId)
+                    .build();
+
+            patientService.save(patientDedupStatus);
+
+            patient.setMasterId(master.getId());
+            patientService.save(patient);
+
+            return master.getId();
+        } catch (Exception e) {
+            throw new ZeDeDupeException("Exception in igonre request of patient[" + patientId + "]>>>>", e);
+        }
+    }
+
+    /**
+     * prepares patient object from fhir message
+     *
+     * @param patientData
+     * @return
+     */
+    protected Patient getPatientDetails(String patientData) {
+        Map<String, Object> map = fromString(patientData, Map.class);
+        Map<String, Object> map1 = (Map<String, Object>) map.get("source");
+        Map<String, Object> map2 = (Map<String, Object>) map.get("id");
+        return Patient.builder().data(patientData)
+                .uuid(map2.get("uuid").toString())
+                .source(map1.get("name").toString())
+                .build();
+    }
+
+    /**
+     * prepares and saves patient object using master id and fhir message
+     *
+     * @param patientData
+     * @return
+     */
+    protected Patient createPatientRecordFromFHIR(Long masterId, String patientData) {
+        Patient patient = getPatientDetails(patientData);
+        patient.setMasterId(masterId);
+        patient.setCreatedById(1L);
+        patient = patientService.save(patient);
+        return patient;
+    }
+
+    /**
+     * creates master record from fhir data
+     *
+     * @param data
+     * @return
+     */
+    protected Master createMasterRecordFromFHIR(String data) {
+        Master master = new Master();
+        Map<String, Object> fhirMap = convertFHIR(data);
+        master.setFirstName((String) fhirMap.get(FIRST_NAME));
+        master.setLastName((String) fhirMap.get(LAST_NAME));
+        master.setMiddleName((String) fhirMap.get(MIDDLE_NAME));
+        master.setGender((Character) fhirMap.get(GENDER));
+        master.setDob(parseDateFromString((String) fhirMap.get(DATE_OF_BIRTH)));
+        return masterService.save(master);
+    }
+
+    /**
+     * merges given patient details into master record
+     *
+     * @param mergeMasterDetails
+     * @param masterId
+     */
+    protected void manualMergeMaster(Map<String, Object> mergeMasterDetails, Long masterId) {
+        Master master = masterService.findOne(masterId);
+        mergeMasterDetails.forEach((key, value) -> {
+            if (FIRST_NAME.equals(key)) {
+                master.setFirstName((String) value);
+            } else if (LAST_NAME.equals(key)) {
+                master.setLastName((String) value);
+            } else if (GENDER.equals(key)) {
+                master.setGender(getGender((String) value));
+            } else if (DATE_OF_BIRTH.equals(key)) {
+                master.setDob(parseDateFromString((String) value));
+            }
+        });
+        masterService.save(master);
+    }
+
+    /**
+     * merge details from patient(fhir) into master record as per conditions in jexl script
+     * call the update method to add updatedMaster map to DB
+     * jexlService.autoMergeScript() => to make script load from cache if available in cache
+     * @param masterId
+     * @param data
+     */
+    protected void autoMergeMaster(Long masterId, String data) {
+        Master master = masterService.findOne(masterId);
+        Map<String, Object> newRecord = FHIRUtil.convertFHIR(data);
+        Map<String, Object> updatedPatientMap = new HashMap<>();
+
+        JexlEngine jexlEngine = new JexlBuilder().create();
+        JexlScript jexlScript = jexlEngine.createScript(jexlService.autoMergeScript());
+        JexlContext jc = new MapContext();
+        jc.set("master",master);
+        jc.set("newRecord",newRecord);
+        jc.set("updatedPatientMap",updatedPatientMap);
+
+        Map<String, Object> updatedMaster = (Map<String, Object>) jexlScript.execute(jc);
+        LOGGER.log(Level.INFO,"auto merged values : "+updatedMaster);
+        // add update method
+    }
+
+}
