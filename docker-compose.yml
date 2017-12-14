@@ -1,0 +1,10 @@
+version: '2'
+services:
+
+  data-dedupe:
+     image: devenc234/data-dedupe
+     network_mode: "host"  
+  dedupe-ui:
+     image: devenc234/zededupe-ui
+     ports:																																																																																																																						
+      - "80:80"
